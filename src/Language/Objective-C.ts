@@ -13,7 +13,8 @@ import {
     ArrayType,
     MapType,
     UnionType,
-    ClassProperty
+    ClassProperty,
+    removeNullFromUnion
 } from "../Type";
 import { TypeGraph } from "../TypeGraph";
 import { Name, Namer, funPrefixNamer } from "../Naming";
@@ -284,8 +285,8 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
         ]);
     }
 
-    protected makeUnionMemberNamer(): null {
-        return null;
+    protected makeUnionMemberNamer(): Namer {
+        return new Namer(propertyNameStyle, []);
     }
 
     protected makeEnumCaseNamer(): Namer {
@@ -633,6 +634,15 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
         });
     }
 
+    private emitUnionInterface(t: UnionType, name: Name): void {
+        this.emitLine("@interface ", name, " : NSObject");
+        const nonNulls = removeNullFromUnion(t)[1];
+        this.forEachUnionMember(t, nonNulls, "none", null, (memberName, _memberType) => {
+            this.emitLine("// ", memberName);
+        });
+        this.emitLine("@end");
+    }
+
     private emitClassInterface = (t: ClassType, className: Name): void => {
         const isTopLevel = this.topLevels.valueSeq().contains(t);
 
@@ -933,7 +943,7 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
                 "none",
                 (_, className) => this.emitLine("@class ", className, ";"),
                 (_, enumName) => this.emitLine("@class ", enumName, ";"),
-                () => null
+                (_, enumName) => this.emitLine("@class ", enumName, ";")
             );
             this.ensureBlankLine();
 
@@ -950,7 +960,7 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
             this.forEachTopLevel(
                 "leading-and-interposing",
                 (t, n) => this.emitNonClassTopLevelTypedef(t, n),
-                t => !(t instanceof ClassType)
+                t => !(t instanceof ClassType || t instanceof UnionType)
             );
 
             const hasTopLevelNonClassTypes = this.topLevels.some(t => !(t instanceof ClassType));
@@ -967,7 +977,12 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
             }
 
             this.emitMark("Object interfaces");
-            this.forEachNamedType("leading-and-interposing", this.emitClassInterface, () => null, () => null);
+            this.forEachNamedType(
+                "leading-and-interposing",
+                this.emitClassInterface,
+                () => null,
+                (t, n) => this.emitUnionInterface(t, n)
+            );
 
             this.ensureBlankLine();
             this.emitLine("NS_ASSUME_NONNULL_END");
