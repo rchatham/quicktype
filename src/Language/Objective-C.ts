@@ -286,7 +286,16 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
     }
 
     protected makeUnionMemberNamer(): Namer {
-        return new Namer(propertyNameStyle, []);
+        return new Namer(
+            "union-members",
+            s => {
+                if (s.startsWith(this._classPrefix)) {
+                    s = s.substr(this._classPrefix.length);
+                }
+                return propertyNameStyle(s + "_value");
+            },
+            []
+        );
     }
 
     protected makeEnumCaseNamer(): Namer {
@@ -372,7 +381,10 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
             enumType => [this.nameForNamedType(enumType), " *"],
             unionType => {
                 const nullable = nullableFromUnion(unionType);
-                return nullable !== null ? this.objcType(nullable, true) : ["id", ""];
+                if (nullable !== null) {
+                    return this.objcType(nullable, true);
+                }
+                return [this.nameForNamedType(unionType), " *"];
             }
         );
     };
@@ -413,7 +425,9 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
             enumType => ["[", this.nameForNamedType(enumType), " withValue:", dynamic, "]"],
             unionType => {
                 const nullable = nullableFromUnion(unionType);
-                return nullable !== null ? this.fromDynamicExpression(nullable, dynamic) : dynamic;
+                return nullable !== null
+                    ? this.fromDynamicExpression(nullable, dynamic)
+                    : ["[", this.nameForNamedType(unionType), " fromDynamicValue:", dynamic, "]"];
             }
         );
     };
@@ -453,12 +467,41 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
                         return ["NSNullify(", this.toDynamicExpression(nullable, typed), ")"];
                     }
                 } else {
-                    // TODO support unions
-                    return typed;
+                    return ["[", typed, " dynamicValue]"];
                 }
             }
         );
     };
+
+    private toTypecheckExpression(t: Type, dynamic: Sourcelike): Sourcelike {
+        return matchType<Sourcelike>(
+            t,
+            _anyType => "YES",
+            _nullType => ["[", dynamic, " isEqual:NSNull.null]"],
+            // Sadly, KVC
+            _boolType => ["([", dynamic, " isEqual:@YES] || [", dynamic, " isEqual:@NO])"],
+            _integerType => ["[", dynamic, " isKindOfClass:NSNumber.class]"],
+            _doubleType => ["[", dynamic, " isKindOfClass:NSNumber.class]"],
+            _stringType => ["[", dynamic, " isKindOfClass:NSString.class]"],
+            arrayType => {
+                return ["map(", dynamic, ", λ(id x, ", this.toTypecheckExpression(arrayType.items, "x"), "))"];
+            },
+            _classType => ["NO /* ", this.objcType(_classType), "?*/"],
+            mapType => {
+                return ["map(", dynamic, ", λ(id x, ", this.toTypecheckExpression(mapType.values, "x"), "))"];
+            },
+            _enumType => ["NO /* ", this.objcType(_enumType), "?*/"],
+            unionType => {
+                const nullable = nullableFromUnion(unionType);
+                if (nullable !== null) {
+                    return "NO";
+                } else {
+                    // TODO support unions
+                    return ["NO /* ", this.objcType(unionType), "?*/"];
+                }
+            }
+        );
+    }
 
     private implicitlyConvertsFromJSON(t: Type): boolean {
         if (t instanceof ClassType) {
@@ -476,8 +519,7 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
             if (nullable !== null) {
                 return this.implicitlyConvertsFromJSON(nullable);
             } else {
-                // We don't support unions yet, so this is just untyped
-                return true;
+                return false;
             }
         } else {
             return false;
@@ -531,8 +573,15 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
         this.emitLine("@end");
     };
 
-    private pointerAwareTypeName(t: Type | [Sourcelike, string]): Sourcelike {
-        const name = t instanceof Type ? this.objcType(t) : t;
+    private emitPrivateUnionInterface = (_: UnionType, name: Name): void => {
+        this.emitLine("@interface ", name, " (JSONConversion)");
+        this.emitLine("+ (instancetype)fromDynamicValue:(id)value;");
+        this.emitLine("- (id)dynamicValue;");
+        this.emitLine("@end");
+    };
+
+    private pointerAwareTypeName(t: Type | [Sourcelike, string], nullableOrBoxed: boolean = false): Sourcelike {
+        const name = t instanceof Type ? this.objcType(t, nullableOrBoxed) : t;
         const isPointer = name[1] !== "";
         return isPointer ? name : [name, " "];
     }
@@ -637,33 +686,71 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
     private emitUnionInterface(t: UnionType, name: Name): void {
         this.emitLine("@interface ", name, " : NSObject");
         const nonNulls = removeNullFromUnion(t)[1];
-        this.forEachUnionMember(t, nonNulls, "none", null, (memberName, _memberType) => {
-            this.emitLine("// ", memberName);
+        this.forEachUnionMember(t, nonNulls, "none", null, (memberName, memberType) => {
+            this.emitProperty(memberName, memberType, true);
         });
         this.emitLine("@end");
+    }
+
+    private emitUnionImplementation(t: UnionType, name: Name): void {
+        this.emitLine("@implementation ", name);
+        this.emitMethod("+ (instancetype)fromDynamicValue:(id)value", () => {
+            this.emitLine("return [[", name, " alloc] initWithDynamicValue:value];");
+        });
+        this.ensureBlankLine();
+
+        const nonNulls = removeNullFromUnion(t)[1];
+        this.emitMethod("- (instancetype)initWithDynamicValue:(id)value", () => {
+            this.emitBlock("if (self = [super init])", () => {
+                let isFirstMember = true;
+                this.forEachUnionMember(t, nonNulls, "none", null, (memberName, memberType) => {
+                    const elseIf = isFirstMember ? "if     " : "else if";
+                    this.emitLine(
+                        elseIf,
+                        " (",
+                        this.toTypecheckExpression(memberType, "value"),
+                        ") _",
+                        memberName,
+                        " = value;"
+                    );
+                    isFirstMember = false;
+                });
+            });
+            this.emitLine("return self;");
+        });
+        this.emitLine("@end");
+    }
+
+    private emitProperty(name: Name, propertyOrType: ClassProperty | Type, isNullable: boolean = false) {
+        const type = propertyOrType instanceof ClassProperty ? propertyOrType.type : propertyOrType;
+        isNullable = isNullable || type.isNullable;
+
+        let attributes = ["nonatomic"];
+        // TODO offer a 'readonly' option
+        // TODO We must add "copy" if it's NSCopy, otherwise "strong"
+        if (isNullable) {
+            attributes.push("nullable");
+        }
+        attributes.push(this.memoryAttribute(type, isNullable));
+        this.emitLine(
+            "@property ",
+            ["(", attributes.join(", "), ")"],
+            " ",
+            this.pointerAwareTypeName(type, isNullable),
+            name,
+            ";"
+        );
     }
 
     private emitClassInterface = (t: ClassType, className: Name): void => {
         const isTopLevel = this.topLevels.valueSeq().contains(t);
 
         this.emitLine("@interface ", className, " : NSObject");
+
         if (DEBUG) this.emitLine("@property NSDictionary<NSString *, id> *_json;");
+
         this.forEachClassProperty(t, "none", (name, _json, property) => {
-            let attributes = ["nonatomic"];
-            // TODO offer a 'readonly' option
-            // TODO We must add "copy" if it's NSCopy, otherwise "strong"
-            if (property.type.isNullable) {
-                attributes.push("nullable");
-            }
-            attributes.push(this.memoryAttribute(property.type, property.type.isNullable));
-            this.emitLine(
-                "@property ",
-                ["(", attributes.join(", "), ")"],
-                " ",
-                this.pointerAwareTypeName(property.type),
-                name,
-                ";"
-            );
+            this.emitProperty(name, property);
         });
 
         if (!this._justTypes && isTopLevel) {
@@ -1018,7 +1105,7 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
                     "leading-and-interposing",
                     this.emitPrivateClassInterface,
                     () => null,
-                    () => null
+                    (t, n) => this.emitPrivateUnionInterface(t, n)
                 );
 
                 if (this.haveEnums) {
@@ -1041,7 +1128,12 @@ class ObjectiveCRenderer extends ConvenienceRenderer {
                 this.forEachTopLevel("leading-and-interposing", (t, n) => this.emitTopLevelFunctions(t, n));
             }
 
-            this.forEachNamedType("leading-and-interposing", this.emitClassImplementation, () => null, () => null);
+            this.forEachNamedType(
+                "leading-and-interposing",
+                this.emitClassImplementation,
+                () => null,
+                (t, n) => this.emitUnionImplementation(t, n)
+            );
 
             if (!this._justTypes) {
                 this.ensureBlankLine();
