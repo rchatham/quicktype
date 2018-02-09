@@ -251,7 +251,7 @@ class CSharpRenderer extends ConvenienceRenderer {
                 return this.nameForNamedType(unionType);
             },
             {
-                dateTimeType: _ => "System.DateTime"
+                dateTimeType: _ => "System.DateTimeOffset"
             }
         );
     };
@@ -451,8 +451,8 @@ class CSharpRenderer extends ConvenienceRenderer {
                             this.emitLine("return;");
                         });
                     } else if (t.kind === "date-time") {
-                        this.emitLine("System.DateTime dt;");
-                        this.emitLine("if (System.DateTime.TryParse(str, out dt))");
+                        this.emitLine("System.DateTimeOffset dt;");
+                        this.emitLine("if (System.DateTimeOffset.TryParse(str, out dt))");
                         this.emitBlock(() => {
                             this.emitLine(fieldName, " = dt;");
                             this.emitLine("return;");
@@ -595,6 +595,7 @@ class CSharpRenderer extends ConvenienceRenderer {
             this.emitBlock(() => {
                 this.emitLine("MetadataPropertyHandling = MetadataPropertyHandling.Ignore,");
                 this.emitLine("DateParseHandling = DateParseHandling.None,");
+                this.emitLine("DateTimeZoneHandling = DateTimeZoneHandling.Utc,");
                 if (this.haveNamedUnions || this.haveEnums) {
                     this.emitLine("Converters = { new Converter() },");
                 }
